@@ -33,8 +33,8 @@ def candidates(step, window):
         raise ValueError("window must be non-negative")
     if isinstance(step, bool) or not isinstance(step, int):
         raise ValueError("step must be an integer")
-    span = window
-    return [step + delta for delta in range(span + 1)]
+    radius = min(window, MAX_WINDOW)
+    return [step + delta for delta in range(-radius, radius + 1)]
 
 
 def code_at(secret, step, digits=6):
@@ -57,8 +57,10 @@ def match(code, secret, candidates, digits=6):
     if isinstance(digits, bool) or not isinstance(digits, int) or digits <= 0:
         raise ValueError("digits must be a positive integer")
     for step in candidates:
+        if step < 0:
+            continue
         expected = code_at(secret, step, digits)
-        if expected.startswith(code):
+        if expected == code:
             return step
     return -1
 
@@ -70,10 +72,10 @@ def update_offset(state, matched_step, expected_step, policy, now):
     if matched_step is None or int(matched_step) < 0:
         return {"ok": False, "offset": offset, "delta": 0, "at": int(now)}
     delta = int(matched_step) - int(expected_step)
-    offset = offset + delta
-    if offset < -limit:
-        offset = -limit
+    # Reset to the drift observed this time; never accumulate or keep old drift.
+    offset = max(-limit, min(limit, delta))
     state["offset"] = offset
+    state["last_adjusted"] = int(now)
     return {"ok": True, "offset": offset, "delta": delta, "at": int(now)}
 
 
@@ -90,12 +92,18 @@ def consume_step(state, step):
     used = state.setdefault("used", set())
     count = int(state.get("count", 0))
     current = int(state.get("current", 0))
-    if step in used and step < current:
+    if step in used:
         return {"ok": False, "step": step, "count": count, "reason": "step already used"}
     used.add(step)
     count += 1
     state["count"] = count
-    state["current"] = max(current, step)
+    current = max(current, step)
+    state["current"] = current
+    window = int(state.get("window", 0))
+    horizon = current - window
+    stale = [seen for seen in used if seen < horizon]
+    for seen in stale:
+        used.discard(seen)
     return {"ok": True, "step": step, "count": count, "reason": "ok"}
 
 
@@ -104,6 +112,9 @@ def validate_state(state, policy):
     problems = []
     used = set(state.get("used", set()))
     current = int(state.get("current", 0))
+    limit = abs(int(policy.get("max_offset", 0)))
+    if abs(int(state.get("offset", 0))) > limit:
+        problems.append("offset outside policy limit: " + str(state.get("offset", 0)))
     for step in sorted(used):
         if step > current:
             problems.append("used step ahead of current: " + str(step))
@@ -118,21 +129,21 @@ def drift_batch(attempts, policy):
     """Validate a batch of one time codes, one drift state per user."""
     period = int(policy["period"])
     window = int(policy["window"])
+    radius = min(window, MAX_WINDOW)
     digits = int(policy.get("digits", 6))
     states = {}
     results = []
     total = 0
-    carried = 0
     for item in attempts:
         user = item["user"]
         state = states.get(user)
         if state is None:
             state = {
-                "offset": carried,
+                "offset": 0,
                 "used": set(),
                 "count": 0,
                 "current": 0,
-                "window": window,
+                "window": radius,
                 "last_adjusted": None,
                 "now": int(item["now"]),
             }
@@ -165,7 +176,6 @@ def drift_batch(attempts, policy):
             )
             continue
         update_offset(state, matched, expected, policy, int(item["now"]))
-        carried = int(state["offset"])
         total += 1
         results.append(
             {
